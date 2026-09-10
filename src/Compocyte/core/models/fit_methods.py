@@ -7,16 +7,73 @@ from scipy import sparse
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import robust_scale
 import torch
+import torch.nn.functional as F
 import logging
 import dask.array as da
 from torch.utils.data import TensorDataset, random_split, DataLoader, IterableDataset, get_worker_info
-from Compocyte.core.models.dense_torch import DenseTorch
+from Compocyte.core.models.dense_torch import DenseTorch, resolve_device
 from Compocyte.core.models.dummy_classifier import DummyClassifier
 from Compocyte.core.models.log_reg import LogisticRegression
 from Compocyte.core.models.trees import BoostedTrees
 from balanced_loss import Loss as BalancedLoss
+from scipy import stats
 
 logger = logging.getLogger(__name__)
+
+# Serializes model invocations so that multithreaded callers (e.g. level-
+# parallel prediction) observe the same BLAS/thread-pool state as sequential
+# execution, keeping predictions bit-identical. Uncontended overhead is ~ns.
+import threading as _threading
+_FORWARD_LOCK = _threading.Lock()
+
+# Normal IQR adjustment used by sklearn's RobustScaler with the default
+# quantile_range=(25.0, 75.0) and unit_variance=True.
+_IQR_ADJUST = float(stats.norm.ppf(0.75) - stats.norm.ppf(0.25))
+_USE_FAST_SCALE = os.environ.get('COMPOCYTE_FAST_SCALE', '1') == '1'
+
+
+def _to_dense(X):
+    """Densify sparse matrices, pass dense arrays through (as ndarray)."""
+    if sparse.issparse(X):
+        return X.toarray()
+    return np.asarray(X)
+
+
+def row_robust_scale(X):
+    """Cell-wise IQR scaling, bit-identical to
+    ``robust_scale(X, axis=1, with_centering=False, copy=False,
+    unit_variance=True)``.
+
+    sklearn computes row quantiles with a Python loop over columns of the
+    transposed sparse matrix (one ``nanpercentile`` call per cell). This
+    instead densifies once and issues a single vectorized ``percentile``
+    call, which runs the same per-slice interpolation kernel and therefore
+    yields bitwise-identical scales and outputs. Matrices containing NaNs
+    fall back to sklearn. Set ``COMPOCYTE_FAST_SCALE=0`` to always use
+    sklearn.
+    """
+    if not _USE_FAST_SCALE:
+        return robust_scale(
+            X, axis=1, with_centering=False, copy=False, unit_variance=True)
+
+    if sparse.issparse(X):
+        X = X.toarray()
+    else:
+        X = np.array(X, copy=True)
+    if X.ndim != 2 or X.shape[0] == 0:
+        return X
+    if X.dtype.kind not in 'f':
+        X = X.astype(np.float64)
+    if np.isnan(X).any():
+        return np.asarray(robust_scale(
+            X, axis=1, with_centering=False, copy=False, unit_variance=True))
+
+    q = np.percentile(X, (25.0, 75.0), axis=1)
+    scale = q[1] - q[0]
+    scale[scale < 10 * np.finfo(scale.dtype).eps] = 1.0
+    scale = scale / _IQR_ADJUST
+    X /= scale[:, None]
+    return X
 
 def to_categorical(y, num_classes, dtype="float32"):
     """
@@ -99,60 +156,17 @@ class DaskBatchDataset(IterableDataset):
         if buf_X:
             yield from _flush(buf_X, buf_y, chunk_sizes)
 
-def predict_logits(model, x):
-    x = robust_scale(x, axis=1, with_centering=False, copy=False, unit_variance=True)
-    if isinstance(x, sparse.csr_matrix):
-        x = sparse.csr_matrix.toarray(x)
-        
-    if isinstance(model, DenseTorch):
-        logits = model.predict_logits(x)
-    
-    elif isinstance(model, LogisticRegression):
-        logits = model.predict_logits(x)
-
-    elif isinstance(model, BoostedTrees):
-        logits = model.predict_logits(x)
-
-    elif isinstance(model, DummyClassifier):
-        logits = model.predict_logits(x)
-
-    else:
-        raise Exception('Unknown classifier type.')
-
-    return logits
-
-def predict(model, x, threshold=-1, monte_carlo: int=None):    
-    x = robust_scale(x, axis=1, with_centering=False, copy=False, unit_variance=True)
+def predict_logits(model, x, batch_size=8192, device=None):
+    x = row_robust_scale(x)
     if isinstance(x, sparse.csr_matrix):
         x = sparse.csr_matrix.toarray(x)
 
-    if monte_carlo is not None:
-        all_logits = []
-        dropout = torch.nn.Dropout(p=0.5)
-        for _ in range(monte_carlo):            
-            x_dropout = np.array(dropout(torch.Tensor(x)))
-            if isinstance(model, DenseTorch):
-                all_logits.append(model.predict_logits(x_dropout))
-            
-            elif isinstance(model, LogisticRegression):
-                all_logits.append(model.predict_logits(x_dropout))
-
-            elif isinstance(model, BoostedTrees):
-                all_logits.append(model.predict_logits(x_dropout))
-
-            elif isinstance(model, DummyClassifier):
-                return model.predict(x)
-            
-            else:
-                raise Exception('Unknown classifier type')
-            
-        all_logits = np.array(all_logits)
-        logits = np.mean(all_logits, axis=0)
-    
-    else:
+    # Serialized so multithreaded callers see identical BLAS/thread-pool
+    # state as sequential execution (bit-identical logits).
+    with _FORWARD_LOCK:
         if isinstance(model, DenseTorch):
-            logits = model.predict_logits(x)
-        
+            logits = model.predict_logits(x, batch_size=batch_size, device=device)
+
         elif isinstance(model, LogisticRegression):
             logits = model.predict_logits(x)
 
@@ -160,10 +174,77 @@ def predict(model, x, threshold=-1, monte_carlo: int=None):
             logits = model.predict_logits(x)
 
         elif isinstance(model, DummyClassifier):
-            return model.predict(x)
-        
+            logits = model.predict_logits(x)
+
         else:
-            raise Exception('Unknown classifier type')
+            raise Exception('Unknown classifier type.')
+
+    return logits
+
+def predict(
+        model, x, threshold=-1, monte_carlo: int=None,
+        mc_dropout_p: float=0.5,
+        batch_size: int=8192,
+        mc_max_rows: int=65536,
+        device=None):
+    if isinstance(model, DummyClassifier):
+        # Single-child node: the label is forced regardless of features, so
+        # skip scaling, densification and feature slicing entirely.
+        return model.predict(x)
+    x = row_robust_scale(x)
+    if isinstance(x, sparse.csr_matrix):
+        x = sparse.csr_matrix.toarray(x)
+
+    if monte_carlo is not None:
+        # Model calls are serialized (see _FORWARD_LOCK) so parallel
+        # callers observe identical numerics to sequential execution.
+        with _FORWARD_LOCK:
+            if isinstance(model, DenseTorch):
+                all_logits = model.predict_logits_mc(
+                    x, monte_carlo,
+                    dropout_p=mc_dropout_p,
+                    batch_size=batch_size,
+                    mc_max_rows=mc_max_rows,
+                    device=device)
+
+            elif isinstance(model, (LogisticRegression, BoostedTrees)):
+                # sklearn/catboost stay on CPU: convert once, then mask the single
+                # resident tensor per iteration instead of re-copying every pass.
+                dev = resolve_device(device)
+                x_arr = np.asarray(x, dtype=np.float32)
+                x_t = torch.from_numpy(x_arr).to(dev)
+                all_logits = []
+                with torch.no_grad():
+                    for _ in range(monte_carlo):
+                        x_masked = F.dropout(x_t, p=mc_dropout_p, training=True).to('cpu').numpy()
+                        all_logits.append(model.predict_logits(x_masked))
+
+                all_logits = np.array(all_logits)
+
+            elif isinstance(model, DummyClassifier):
+                return model.predict(x)
+
+            else:
+                raise Exception('Unknown classifier type')
+
+        logits = np.mean(all_logits, axis=0)
+
+    else:
+        with _FORWARD_LOCK:
+            if isinstance(model, DenseTorch):
+                logits = model.predict_logits(x, batch_size=batch_size, device=device)
+
+            elif isinstance(model, LogisticRegression):
+                logits = model.predict_logits(x)
+
+            elif isinstance(model, BoostedTrees):
+                logits = model.predict_logits(x)
+
+            elif isinstance(model, DummyClassifier):
+                return model.predict(x)
+
+            else:
+                raise Exception('Unknown classifier type')
         
     max_activation = np.max(logits, axis=1)
     pred = np.argmax(logits, axis=1).astype(int)
@@ -212,7 +293,7 @@ def dataloaders_from_dask(x, y, batch_size, num_workers):
     batch_size = min(batch_size, x_train.shape[0])
     x_train = da.from_array(x_train, chunks=(batch_size, x_train.shape[1]))
     x_train = x_train.map_blocks(
-        sparse.csr_matrix.toarray, 
+        _to_dense,
         dtype=np.float32)
     y_train = da.from_array(y_train, chunks=(batch_size, y_train.shape[1]))
     train_dataset = DaskBatchDataset(x_train, y_train)
@@ -222,7 +303,7 @@ def dataloaders_from_dask(x, y, batch_size, num_workers):
     batch_size = min(batch_size, x_val.shape[0])
     x_val = da.from_array(x_val, chunks=(batch_size, x_val.shape[1]))
     x_val = x_val.map_blocks(
-        sparse.csr_matrix.toarray, 
+        _to_dense,
         dtype=np.float32)
     y_val = da.from_array(y_val, chunks=(batch_size, y_val.shape[1]))
     val_dataset = DaskBatchDataset(x_val, y_val)
@@ -233,7 +314,7 @@ def dataloaders_from_dask(x, y, batch_size, num_workers):
 
 def dataloaders_from_dense(x, y, batch_size, num_workers):
     x = torch.from_numpy(
-        sparse.csr_matrix.toarray(x)
+        _to_dense(x)
     ).to(torch.float32)
     y = torch.from_numpy(y).to(torch.float32)
     dataset = TensorDataset(x, y)
@@ -265,9 +346,15 @@ def fit_torch(
         epochs: int=40, batch_size: int=64, 
         starting_lr: float=0.01, max_lr: float=0.1, momentum: float=0.5, 
         parallelize: bool=True, num_threads: int=1, 
-        beta: float=0.8, gamma: float=2.0, class_balance: bool=True, max_cells: int=1_000_000):
+        beta: float=0.8, gamma: float=2.0, class_balance: bool=True, max_cells: int=1_000_000,
+        device=None):
     
     num_workers = set_threads(num_threads, parallelize)
+    dev = resolve_device(device or getattr(model, 'device', None))
+    if hasattr(model, 'to_device'):
+        model.to_device(dev)
+    else:
+        model.to(dev)
     y = to_categorical(y, num_classes=len(model.labels_enc.keys()))    
     total_samples = x.shape[0]
     if total_samples > max_cells:
@@ -309,6 +396,8 @@ def fit_torch(
         model.train()
         cumulative_loss = 0
         for xb, yb in train_dataloader:
+            xb = xb.to(dev, non_blocking=True)
+            yb = yb.to(dev, non_blocking=True)
             logits = model(xb)
             logits = torch.clamp(logits, 0, 1)
             loss = loss_function(logits, torch.argmax(yb, dim=-1).to(torch.int64))
@@ -326,6 +415,8 @@ def fit_torch(
             val_dataloader.dataset.set_epoch(epoch)
 
         for xb, yb in val_dataloader:                
+            xb = xb.to(dev, non_blocking=True)
+            yb = yb.to(dev, non_blocking=True)
             logits = model(xb)
             logits = torch.clamp(logits, 0, 1)
             val_loss = loss_function(logits, torch.argmax(yb, dim=-1).to(torch.int64)).item()
@@ -379,17 +470,22 @@ def fit(
     Returns:
         _type_: _description_
     """
-    
+    if isinstance(model, DummyClassifier):
+        # Single-child node: nothing to learn from features.
+        model.is_fitted = True
+        return model.fit(x, y)
+
     # Standardize batches separately if list of idxs per dataset is provided
     if standardize_idx is not None:
         for idx in standardize_idx:
-            x[idx] = robust_scale(x[idx], axis=1, with_centering=False, copy=False, unit_variance=True)
+            scaled = row_robust_scale(x[idx])
+            x[idx] = sparse.csr_matrix(scaled) if sparse.issparse(x) else scaled
     else:
-        x = robust_scale(x, axis=1, with_centering=False, copy=False, unit_variance=True)
+        x = row_robust_scale(x)
 
     
     if not isinstance(model, DenseTorch):
-        x = sparse.csr_matrix.toarray(x)
+        x = _to_dense(x)
 
     y = np.array([model.labels_enc[label] for label in y])
     if isinstance(model, DenseTorch):

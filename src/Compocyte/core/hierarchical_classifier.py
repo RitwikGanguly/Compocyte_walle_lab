@@ -394,21 +394,30 @@ class HierarchicalClassifier(
             self,
             node: str,
             features: list=None,
-            for_trial: bool=False) -> sc.AnnData:
+            for_trial: bool=False,
+            allow_fallback: bool=True) -> sc.AnnData:
         """Select cells assigned to a given node for inference.
 
         In normal prediction mode cells are selected by their previously predicted
         label at the node's depth level. When the predicted obs column does not yet
-        exist, all cells are returned (root-level fallback). With ``for_trial=True``
-        ground-truth labels are used instead of predictions.
+        exist, all cells are returned (root-level fallback) if ``allow_fallback``
+        is ``True``; otherwise an empty subset is returned, since no cells were
+        routed to this node. With ``for_trial=True`` ground-truth labels are used
+        instead of predictions.
 
         Args:
             node (str): Name of the hierarchy node.
             features (list of str, optional): Gene/feature names to restrict the
                 returned subset to. If ``None``, all features are included.
             for_trial (bool): If ``True``, uses ground-truth obs labels instead of
-                predicted labels to select cells, to train with all ground-truth relevant 
+                predicted labels to select cells, to train with all ground-truth relevant
                 cells. Defaults to ``False``.
+            allow_fallback (bool): If ``True`` (default), fall back to all cells
+                when the routing column is absent (traversal start). If ``False``,
+                return an empty subset instead. Set
+                ``COMPOCYTE_LEGACY_FALLBACK=1`` to force the legacy fallback for
+                non-start nodes (exact v1.0 reproduction, including its wasted
+                full-atlas classifications).
 
         Returns:
             sc.AnnData: Subset of ``self.adata`` containing cells associated with
@@ -418,11 +427,16 @@ class HierarchicalClassifier(
             >>> subset = hc.select_subset_prediction('T cell')
             >>> subset = hc.select_subset_prediction('T cell', for_trial=True)
         """
+        if os.environ.get('COMPOCYTE_LEGACY_FALLBACK', '0') == '1':
+            allow_fallback = True
 
         obs = self.obs_names[self.node_to_depth[node]]
         obs = f'{obs}_pred'
         if obs not in self.adata.obs.columns and not for_trial:
-            subset = self.adata
+            if allow_fallback:
+                subset = self.adata
+            else:
+                subset = self.adata[0:0]
 
         elif obs not in self.adata.obs.columns and for_trial:
             is_node = self.adata.obs[self.obs_names[self.node_to_depth[node]]] == node
@@ -800,7 +814,12 @@ class HierarchicalClassifier(
         self,
         node: str,
         threshold: float=-1,
-        monte_carlo: int=None) -> np.ndarray:
+        monte_carlo: int=None,
+        mc_dropout_p: float=0.5,
+        batch_size: int=8192,
+        mc_max_rows: int=65536,
+        device=None,
+        allow_fallback: bool=True) -> np.ndarray:
         """Run inference at a single hierarchy node and write predictions to adata.obs.
 
         Selects cells currently routed to ``node``, runs the node's local classifier,
@@ -821,6 +840,17 @@ class HierarchicalClassifier(
             monte_carlo (int, optional): Number of Monte Carlo dropout forward passes
                 for uncertainty estimation. If ``None``, standard deterministic
                 inference is used.
+            mc_dropout_p (float): Input-feature dropout rate for MC passes.
+                Defaults to ``0.5`` (historical behavior).
+            batch_size (int): Cells per inference chunk; bounds peak memory on
+                large atlases and GPUs. Defaults to ``8192``.
+            mc_max_rows (int): Cap on ``monte_carlo * cells`` rows per fused MC
+                forward pass. Defaults to ``65536``.
+            device: Torch device (e.g. ``'cuda'``) or ``None`` for auto-detect
+                (CUDA > MPS > CPU).
+            allow_fallback (bool): If ``True`` (default), fall back to all cells
+                when the routing column is absent. Direct single-node calls keep
+                the historical behavior; traversals disable it past the start.
 
         Returns:
             numpy.ndarray: Array of predicted child-level cell-type labels for cells
@@ -829,31 +859,77 @@ class HierarchicalClassifier(
         Example:
             >>> pred = hc.predict_single_node('T cell')
             >>> pred = hc.predict_single_node('T cell', threshold=0.9, monte_carlo=100)
+            >>> pred = hc.predict_single_node('T cell', device='cuda', batch_size=16384)
         """
 
         if 'local_classifier' not in self.graph.nodes[node]:
             return []
-        
-        features = self.graph.nodes[node]['selected_var_names']
-        subset = self.select_subset_prediction(node, features=features)
-        if len(subset) == 0:
-            return
-        
-        model = self.graph.nodes[node]['local_classifier']
-        x = subset.X
-        print(f'Predicting at {node}.')
 
-        pred = predict(model, x, threshold=threshold, monte_carlo=monte_carlo)
+        subset_obs_names, pred, all_logits = self._predict_compute(
+            node, threshold=threshold, monte_carlo=monte_carlo,
+            mc_dropout_p=mc_dropout_p, batch_size=batch_size,
+            mc_max_rows=mc_max_rows, device=device,
+            allow_fallback=allow_fallback)
+        if pred is None:
+            return
+
+        print(f'Predicting at {node}.')
+        self._predict_writeback(node, subset_obs_names, pred, all_logits,
+                                monte_carlo=monte_carlo)
+
+        return pred
+
+    def _predict_compute(
+            self, node, threshold=-1, monte_carlo=None, mc_dropout_p=0.5,
+            batch_size=8192, mc_max_rows=65536, device=None,
+            allow_fallback=True):
+        """Compute predictions for one node without touching ``self.adata``.
+
+        Read-only with respect to shared state, hence safe to run in worker
+        threads. Returns ``(subset_obs_names, pred, all_logits)`` or
+        ``(None, None, None)`` when the node has no classifier or no cells.
+        """
+        if 'local_classifier' not in self.graph.nodes[node]:
+            return None, None, None
+
+        model = self.graph.nodes[node]['local_classifier']
+        if isinstance(model, DummyClassifier):
+            # Single-child node: no features needed, skip the feature slice.
+            subset = self.select_subset_prediction(
+                node, allow_fallback=allow_fallback)
+        else:
+            features = self.graph.nodes[node]['selected_var_names']
+            subset = self.select_subset_prediction(
+                node, features=features, allow_fallback=allow_fallback)
+        if len(subset) == 0:
+            return None, None, None
+
+        pred = predict(
+            model, subset.X,
+            threshold=threshold,
+            monte_carlo=monte_carlo,
+            mc_dropout_p=mc_dropout_p,
+            batch_size=batch_size,
+            mc_max_rows=mc_max_rows,
+            device=device)
         all_logits = None
         if monte_carlo is not None and isinstance(pred, tuple):
             pred, all_logits = pred
             if len(all_logits.shape) < 3:
                 all_logits = np.expand_dims(all_logits, axis=1)
 
-        
+        overclustering = None
         if 'overclustering' in subset.obs.columns:
-            for cluster_name in subset.obs['overclustering'].unique():
-                cluster_indices = subset.obs['overclustering'] == cluster_name
+            overclustering = subset.obs['overclustering'].values
+        return subset.obs_names, pred, (all_logits, overclustering)
+
+    def _predict_writeback(self, node, subset_obs_names, pred, packed,
+                           monte_carlo=None):
+        """Write one node's predictions into ``self.adata.obs`` (main thread)."""
+        all_logits, overclustering = packed
+        if overclustering is not None:
+            for cluster_name in np.unique(overclustering):
+                cluster_indices = overclustering == cluster_name
                 if np.sum(cluster_indices) > 0:
                     cluster_preds = pred[cluster_indices]
                     if len(cluster_preds) > 0:
@@ -867,7 +943,7 @@ class HierarchicalClassifier(
             
         self.adata.obs[child_obs] = self.adata.obs[child_obs].astype(str)
         self.adata.obs.loc[
-            subset.obs_names,
+            subset_obs_names,
             child_obs
         ] = pred
         if monte_carlo is not None and all_logits is not None:
@@ -893,11 +969,11 @@ class HierarchicalClassifier(
             mean_activation_chosen_label_per_sample = np.mean(activations_chosen_label_per_sample, axis=axis)
             std_activations_chosen_label_per_sample = np.std(activations_chosen_label_per_sample, axis=axis)
             self.adata.obs.loc[
-                subset.obs_names,
+                subset_obs_names,
                 'monte_carlo_mean',
             ] = mean_activation_chosen_label_per_sample
             self.adata.obs.loc[
-                subset.obs_names,
+                subset_obs_names,
                 'monte_carlo_std',
             ] = std_activations_chosen_label_per_sample
 
@@ -908,7 +984,13 @@ class HierarchicalClassifier(
         node: str,
         threshold: float=-1,
         mlnp: bool=False,
-        monte_carlo: int=None):
+        monte_carlo: int=None,
+        mc_dropout_p: float=0.5,
+        batch_size: int=8192,
+        mc_max_rows: int=65536,
+        device=None,
+        parallel: bool=False,
+        max_workers: int=None):
         """Recursively predict cell types from a starting node down the hierarchy.
 
         Calls :meth:`predict_single_node` at ``node``, then recurses into each child
@@ -925,20 +1007,126 @@ class HierarchicalClassifier(
                 Defaults to ``False``.
             monte_carlo (int, optional): Number of Monte Carlo dropout iterations,
                 forwarded to :meth:`predict_single_node`.
+            mc_dropout_p (float): Input-feature dropout rate for MC passes.
+            batch_size (int): Cells per inference chunk (memory bound).
+            mc_max_rows (int): Cap on fused MC rows per forward pass.
+            device: Torch device or ``None`` for auto-detect (CUDA > MPS > CPU).
+            parallel (bool): If ``True``, predict nodes level by level, running
+                nodes of the same depth concurrently in threads while writing
+                results back serially. Node-level math is unchanged, so
+                predictions are identical to sequential traversal. Defaults to
+                ``False``.
+            max_workers (int, optional): Thread pool size for ``parallel=True``.
+                Defaults to ``min(8, os.cpu_count())``.
 
         Example:
             >>> hc.predict_all_child_nodes(hc.root_node)
             >>> hc.predict_all_child_nodes(hc.root_node, threshold=0.9)
             >>> hc.predict_all_child_nodes(hc.root_node, monte_carlo=50)
+            >>> hc.predict_all_child_nodes(hc.root_node, device='cuda')
+            >>> hc.predict_all_child_nodes(hc.root_node, parallel=True)
         """
+        if parallel:
+            self._predict_subtree_parallel(
+                node, threshold=threshold, mlnp=mlnp,
+                monte_carlo=monte_carlo, mc_dropout_p=mc_dropout_p,
+                batch_size=batch_size, mc_max_rows=mc_max_rows,
+                device=device, max_workers=max_workers)
+            return
+
         # For mandatory leaf node prediction use -1
         if not mlnp:
             threshold = self.graph.nodes[node].get('threshold', threshold)
 
-        self.predict_single_node(node, threshold=threshold, monte_carlo=monte_carlo)
+        self.predict_single_node(
+            node, threshold=threshold, monte_carlo=monte_carlo,
+            mc_dropout_p=mc_dropout_p, batch_size=batch_size,
+            mc_max_rows=mc_max_rows, device=device,
+            allow_fallback=True)
         for child_node in self.get_child_nodes(node):
             if len(self.get_child_nodes(child_node)) == 0:
                 continue
 
-            self.predict_all_child_nodes(child_node, threshold=threshold, mlnp=mlnp, monte_carlo=monte_carlo)
+            self._predict_subtree_sequential(
+                child_node, threshold=threshold, mlnp=mlnp,
+                monte_carlo=monte_carlo, mc_dropout_p=mc_dropout_p,
+                batch_size=batch_size, mc_max_rows=mc_max_rows,
+                device=device)
+
+    def _predict_subtree_sequential(
+            self, node, threshold=-1, mlnp=False, monte_carlo=None,
+            mc_dropout_p=0.5, batch_size=8192, mc_max_rows=65536,
+            device=None):
+        """Recursive driver for non-start nodes: no all-cells fallback."""
+        if not mlnp:
+            threshold = self.graph.nodes[node].get('threshold', threshold)
+
+        self.predict_single_node(
+            node, threshold=threshold, monte_carlo=monte_carlo,
+            mc_dropout_p=mc_dropout_p, batch_size=batch_size,
+            mc_max_rows=mc_max_rows, device=device,
+            allow_fallback=False)
+        for child_node in self.get_child_nodes(node):
+            if len(self.get_child_nodes(child_node)) == 0:
+                continue
+
+            self._predict_subtree_sequential(
+                child_node, threshold=threshold, mlnp=mlnp,
+                monte_carlo=monte_carlo, mc_dropout_p=mc_dropout_p,
+                batch_size=batch_size, mc_max_rows=mc_max_rows,
+                device=device)
+
+    def _predict_subtree_parallel(
+            self, node, threshold=-1, mlnp=False, monte_carlo=None,
+            mc_dropout_p=0.5, batch_size=8192, mc_max_rows=65536,
+            device=None, max_workers=None):
+        """Breadth-first parallel driver for :meth:`predict_all_child_nodes`.
+
+        Nodes at the same depth are independent given their parents'
+        predictions, so their compute runs concurrently while all
+        ``adata.obs`` writes stay serial in deterministic node order.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        if max_workers is None:
+            max_workers = min(8, os.cpu_count() or 4)
+
+        frontier = [(node, threshold, True)]
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            while frontier:
+                # Per-node thresholds first (serial, deterministic order).
+                # Mirrors the sequential recursion, where a node's effective
+                # threshold is inherited by its children unless mlnp=True.
+                jobs = []
+                for parent, inherited, is_start in frontier:
+                    if mlnp:
+                        local_threshold = inherited
+                    else:
+                        local_threshold = self.graph.nodes[parent].get(
+                            'threshold', inherited)
+                    print(f'Predicting at {parent}.')
+                    jobs.append((parent, local_threshold, pool.submit(
+                        self._predict_compute, parent,
+                        threshold=local_threshold, monte_carlo=monte_carlo,
+                        mc_dropout_p=mc_dropout_p, batch_size=batch_size,
+                        mc_max_rows=mc_max_rows, device=device,
+                        allow_fallback=is_start)))
+
+                children = []
+                # Gather every level's results before any writeback so no
+                # worker ever reads adata.obs concurrently with a mutation.
+                results = [(parent, local_threshold, future.result())
+                           for parent, local_threshold, future in jobs]
+                for parent, local_threshold, result in results:
+                    subset_obs_names, pred, packed = result
+                    if pred is None:
+                        pass
+                    else:
+                        self._predict_writeback(
+                            parent, subset_obs_names, pred, packed,
+                            monte_carlo=monte_carlo)
+                    for child_node in self.get_child_nodes(parent):
+                        if len(self.get_child_nodes(child_node)) == 0:
+                            continue
+                        children.append((child_node, local_threshold, False))
+                frontier = children
 
