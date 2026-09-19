@@ -135,4 +135,11 @@ dmypy.json
 **/exclude
 **/cellxgene_tools.py
 compocyte_suco.pdf
-/comparison
+
+comparison/data
+
+comparison/modification_docs
+
+comparison/result
+
+comparison/standalone_model
