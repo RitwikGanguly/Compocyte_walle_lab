@@ -1,5 +1,6 @@
 from copy import deepcopy
 import os
+import time
 from typing import Union
 import numpy as np
 import pandas as pd
@@ -10,7 +11,8 @@ import torch
 import torch.nn.functional as F
 import logging
 import dask.array as da
-from torch.utils.data import TensorDataset, random_split, DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import TensorDataset, random_split, DataLoader, IterableDataset, Dataset, get_worker_info
+from functools import partial
 from Compocyte.core.models.dense_torch import DenseTorch, resolve_device
 from Compocyte.core.models.dummy_classifier import DummyClassifier
 from Compocyte.core.models.log_reg import LogisticRegression
@@ -30,6 +32,74 @@ _FORWARD_LOCK = _threading.Lock()
 # quantile_range=(25.0, 75.0) and unit_variance=True.
 _IQR_ADJUST = float(stats.norm.ppf(0.75) - stats.norm.ppf(0.25))
 _USE_FAST_SCALE = os.environ.get('COMPOCYTE_FAST_SCALE', '1') == '1'
+_USE_SPARSE_TRAIN = os.environ.get('COMPOCYTE_SPARSE_TRAIN', '1') == '1'
+
+
+def _total_ram_bytes():
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+    except Exception:
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        return int(line.split()[1]) * 1024
+        except Exception:
+            pass
+    return 8 * 1024 ** 3
+
+
+def train_resource_budget():
+    max_threads = int(os.environ.get('COMPOCYTE_MAX_THREADS', '16'))
+    ram_frac = float(os.environ.get('COMPOCYTE_MAX_RAM_FRACTION', '0.5'))
+    ram_frac = min(max(ram_frac, 0.05), 0.95)
+    return {
+        'max_threads': max(1, max_threads),
+        'ram_budget_bytes': int(_total_ram_bytes() * ram_frac),
+    }
+
+
+def peak_rss_bytes():
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    except Exception:
+        return 0
+
+
+def current_rss_bytes():
+    try:
+        with open('/proc/self/statm') as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf('SC_PAGE_SIZE')
+    except Exception:
+        return 0
+
+
+def _resolve_loader_config(n_cells, n_genes, batch_size, num_workers, device=None):
+    budget = train_resource_budget()
+    dense_bytes = n_cells * n_genes * 4
+    batch_bytes = batch_size * n_genes * 4
+    workers = int(num_workers)
+    # Trust the caller's worker choice. GPU callers pass num_workers>0 so that
+    # fork-safe CPU workers prefetch and pin batches while the main process
+    # owns CUDA; CPU callers that run nodes in a process pool pass 0 workers.
+    prefetch = 2
+    if dense_bytes > budget['ram_budget_bytes']:
+        workers = min(workers, 2)
+    while workers > 0 and batch_bytes * workers * prefetch > budget['ram_budget_bytes']:
+        workers -= 1
+    while batch_bytes > budget['ram_budget_bytes'] and batch_size > 1:
+        batch_size //= 2
+        batch_bytes = batch_size * n_genes * 4
+    return {
+        'batch_size': max(1, int(batch_size)),
+        'num_workers': max(0, workers),
+        'prefetch_factor': prefetch,
+        'sparse': dense_bytes > budget['ram_budget_bytes'],
+        'dense_bytes': dense_bytes,
+        'ram_budget_bytes': budget['ram_budget_bytes'],
+    }
 
 
 def _to_dense(X):
@@ -74,6 +144,29 @@ def row_robust_scale(X):
     scale = scale / _IQR_ADJUST
     X /= scale[:, None]
     return X
+
+
+def row_robust_scale_sparse(X, chunk_rows=4096):
+    """Row-wise IQR scaling that keeps the result sparse.
+
+    Row scaling divides every entry by a per-row scalar, so zero entries stay
+    zero and the CSR structure is preserved. Scaling is applied per row chunk
+    through :func:`row_robust_scale`, so the numerics are identical to the
+    dense path while peak dense memory is bounded by ``chunk_rows`` rows
+    instead of the whole matrix.
+    """
+    if not _USE_SPARSE_TRAIN:
+        return row_robust_scale(X)
+
+    X = X.tocsr()
+    if X.shape[0] == 0:
+        return X
+    chunk_rows = max(1, int(chunk_rows))
+    blocks = []
+    for start in range(0, X.shape[0], chunk_rows):
+        block = row_robust_scale(X[start:start + chunk_rows].toarray())
+        blocks.append(sparse.csr_matrix(block))
+    return sparse.vstack(blocks, format='csr') if len(blocks) > 1 else blocks[0]
 
 def to_categorical(y, num_classes, dtype="float32"):
     """
@@ -128,6 +221,18 @@ class DaskBatchDataset(IterableDataset):
 
         window_size = 5
         buf_X, buf_y, chunk_sizes = [], [], []
+        pending = []
+
+        def _drain():
+            if not pending:
+                return
+            flat = [d for pair in pending for d in pair]
+            done = da.compute(*flat)
+            for i in range(0, len(done), 2):
+                buf_X.append(np.asarray(done[i]))
+                buf_y.append(np.asarray(done[i + 1]))
+                chunk_sizes.append(np.asarray(done[i]).shape[0])
+            pending.clear()
 
         def _flush(buf_X, buf_y, chunk_sizes):
             X_buf = np.concatenate(buf_X, axis=0)
@@ -143,18 +248,34 @@ class DaskBatchDataset(IterableDataset):
                 start += size
 
         for X_chunk, y_chunk in chunk_iter:
-            X_np = X_chunk.compute()
-            y_np = y_chunk.compute()
-            buf_X.append(X_np)
-            buf_y.append(y_np)
-            chunk_sizes.append(len(X_np))
+            pending.append((X_chunk, y_chunk))
 
-            if len(buf_X) == window_size:
+            if len(pending) == window_size:
+                _drain()
                 yield from _flush(buf_X, buf_y, chunk_sizes)
                 buf_X, buf_y, chunk_sizes = [], [], []
 
+        _drain()
         if buf_X:
             yield from _flush(buf_X, buf_y, chunk_sizes)
+
+class SparseBatchDataset(Dataset):
+    def __init__(self, X_csr, y_cat):
+        self.X_csr = X_csr.tocsr() if not isinstance(X_csr, sparse.csr_matrix) else X_csr
+        self.n = self.X_csr.shape[0]
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        return int(idx)
+
+
+def _sparse_collate(batch_idx, X_csr, y_cat):
+    idx = np.asarray(batch_idx, dtype=np.int64)
+    xb = torch.from_numpy(np.asarray(X_csr[idx].toarray(), dtype=np.float32))
+    yb = torch.from_numpy(np.asarray(y_cat)[idx]).to(torch.float32)
+    return xb, yb
 
 def predict_logits(model, x, batch_size=8192, device=None):
     x = row_robust_scale(x)
@@ -264,62 +385,121 @@ def samples_per_class(y):
 
     return spc
 
-def set_threads(num_threads, parallelize):
-    if num_threads > 10 and not parallelize:
-        # 4 for dask, 4 for dataloader, the rest for torch
-        num_workers = 4
-        num_threads = num_threads - 4 - 4
-
-    else:
+def set_threads(num_threads, parallelize, num_workers=None):
+    budget = train_resource_budget()
+    env_workers = os.environ.get('COMPOCYTE_NUM_WORKERS')
+    if env_workers is not None:
+        num_workers = max(0, int(env_workers))
+    elif num_workers is not None:
+        num_workers = max(0, int(num_workers))
+    elif parallelize:
+        # When training nodes in parallel (CPU pool), each child process owns
+        # its DataLoader; using workers inside each child adds overhead.
         num_workers = 0
-        num_threads = 1
+    else:
+        cpu = os.cpu_count() or 4
+        num_workers = min(4, max(1, cpu // 8))
+    try:
+        want_threads = int(num_threads)
+    except Exception:
+        want_threads = 1
+    num_threads = max(1, min(want_threads, budget['max_threads']) - num_workers)
 
-    logger.info(f'num_workers set to {num_workers}')    
+    logger.info(f'num_workers set to {num_workers}')
     torch.set_num_threads(num_threads)
     logger.info(f'num_threads set to {torch.get_num_threads()}')
     return num_workers
 
-def dataloaders_from_dask(x, y, batch_size, num_workers):
+def dataloaders_from_dask(x, y, batch_size, num_workers, seed=12345, pin_memory=False):
     total_samples = x.shape[0]
 
     indices = np.arange(total_samples)
-    rng = np.random.default_rng(12345)
+    rng = np.random.default_rng(seed)
     rng.shuffle(indices)
-    indices_train = indices[:int(np.floor(total_samples * .8))]
-    indices_val = indices[int(np.floor(total_samples * .8)):]
-    x_train, y_train = x[indices_train], y[indices_train]
-    x_val, y_val = x[indices_val], y[indices_val]
+    indices_train = np.sort(indices[:int(np.floor(total_samples * .8))])
+    indices_val = np.sort(indices[int(np.floor(total_samples * .8)):])
+    x_d = da.from_array(np.asarray(x), chunks=(max(1, batch_size), x.shape[1]))
+    y_d = da.from_array(np.asarray(y), chunks=(max(1, batch_size), y.shape[1]))
+    x_train, y_train = x_d[indices_train], y_d[indices_train]
+    x_val, y_val = x_d[indices_val], y_d[indices_val]
 
-    batch_size = min(batch_size, x_train.shape[0])
-    x_train = da.from_array(x_train, chunks=(batch_size, x_train.shape[1]))
+    cfg = _resolve_loader_config(total_samples, x.shape[1], batch_size, num_workers)
+    batch_size = min(cfg['batch_size'], x_train.shape[0])
+    x_train = x_train.rechunk((batch_size, x_train.shape[1]))
     x_train = x_train.map_blocks(
         _to_dense,
         dtype=np.float32)
-    y_train = da.from_array(y_train, chunks=(batch_size, y_train.shape[1]))
+    y_train = y_train.rechunk((batch_size, y_train.shape[1]))
     train_dataset = DaskBatchDataset(x_train, y_train)
     num_batches = len(train_dataset.X_chunks)
-    train_dataloader = DataLoader(train_dataset, batch_size=None, num_workers=num_workers)
+    train_dataloader = DataLoader(
+        train_dataset, batch_size=None, num_workers=cfg['num_workers'],
+        pin_memory=bool(pin_memory) and torch.cuda.is_available(),
+        **({'prefetch_factor': cfg['prefetch_factor']} if cfg['num_workers'] > 0 else {}))
 
     batch_size = min(batch_size, x_val.shape[0])
-    x_val = da.from_array(x_val, chunks=(batch_size, x_val.shape[1]))
+    x_val = x_val.rechunk((batch_size, x_val.shape[1]))
     x_val = x_val.map_blocks(
         _to_dense,
         dtype=np.float32)
-    y_val = da.from_array(y_val, chunks=(batch_size, y_val.shape[1]))
+    y_val = y_val.rechunk((batch_size, y_val.shape[1]))
     val_dataset = DaskBatchDataset(x_val, y_val)
     num_batches_val = len(val_dataset.X_chunks)
-    val_dataloader = DataLoader(val_dataset, batch_size=None, num_workers=num_workers)
+    val_dataloader = DataLoader(
+        val_dataset, batch_size=None, num_workers=cfg['num_workers'],
+        pin_memory=bool(pin_memory) and torch.cuda.is_available(),
+        **({'prefetch_factor': cfg['prefetch_factor']} if cfg['num_workers'] > 0 else {}))
 
     return train_dataloader, val_dataloader, num_batches, num_batches_val
 
-def dataloaders_from_dense(x, y, batch_size, num_workers):
-    x = torch.from_numpy(
-        _to_dense(x)
-    ).to(torch.float32)
-    y = torch.from_numpy(y).to(torch.float32)
+def _seeded_split(dataset, seed):
+    gen = torch.Generator().manual_seed(int(seed))
+    return random_split(dataset, [0.8, 0.2], generator=gen)
+
+def _loader_kwargs(workers, prefetch, pin):
+    kw = {'num_workers': workers, 'pin_memory': bool(pin) and torch.cuda.is_available()}
+    if workers > 0:
+        kw['prefetch_factor'] = prefetch
+        kw['persistent_workers'] = True
+    return kw
+
+def dataloaders_from_dense(x, y, batch_size, num_workers, seed=12345, pin_memory=False):
+    n_cells = x.shape[0]
+    n_genes = x.shape[1]
+    cfg = _resolve_loader_config(n_cells, n_genes, batch_size, num_workers)
+    batch_size, workers = cfg['batch_size'], cfg['num_workers']
+    sparse_kw = _loader_kwargs(workers, cfg['prefetch_factor'], pin_memory)
+
+    if sparse.issparse(x):
+        dataset = SparseBatchDataset(x, y)
+        collate = partial(_sparse_collate, X_csr=dataset.X_csr, y_cat=np.asarray(y))
+        train_dataset, val_dataset = _seeded_split(dataset, seed)
+        batch_size = min(batch_size, len(train_dataset))
+        leaves_remainder = len(train_dataset) % batch_size == 1
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=leaves_remainder,
+            collate_fn=collate,
+            **sparse_kw)
+
+        batch_size = min(batch_size, len(val_dataset))
+        leaves_remainder = len(val_dataset) % batch_size == 1
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=leaves_remainder,
+            collate_fn=collate,
+            **sparse_kw)
+
+        return train_dataloader, val_dataloader
+
+    x = torch.from_numpy(np.asarray(x)).to(torch.float32)
+    y = torch.from_numpy(np.asarray(y)).to(torch.float32)
     dataset = TensorDataset(x, y)
-    train_dataset, val_dataset = random_split(
-        dataset, [0.8, 0.2])
+    train_dataset, val_dataset = _seeded_split(dataset, seed)
     batch_size = min(batch_size, len(train_dataset))
     leaves_remainder = len(train_dataset) % batch_size == 1
     train_dataloader = DataLoader(
@@ -327,17 +507,17 @@ def dataloaders_from_dense(x, y, batch_size, num_workers):
         batch_size=batch_size,
         shuffle=True,
         drop_last=leaves_remainder,
-        num_workers=num_workers)
-    
-    batch_size = min(batch_size, len(val_dataset))    
+        **sparse_kw)
+
+    batch_size = min(batch_size, len(val_dataset))
     leaves_remainder = len(val_dataset) % batch_size == 1
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         drop_last=leaves_remainder,
-        num_workers=num_workers)
-    
+        **sparse_kw)
+
     return train_dataloader, val_dataloader
 
 def fit_torch(
@@ -345,11 +525,13 @@ def fit_torch(
         x: np.array, y: np.array, 
         epochs: int=40, batch_size: int=64, 
         starting_lr: float=0.01, max_lr: float=0.1, momentum: float=0.5, 
-        parallelize: bool=True, num_threads: int=1, 
+        parallelize: bool=True, num_threads: int=1, num_workers: int=None,
         beta: float=0.8, gamma: float=2.0, class_balance: bool=True, max_cells: int=1_000_000,
-        device=None):
+        device=None, seed: int=12345, resource_stats: dict=None):
     
-    num_workers = set_threads(num_threads, parallelize)
+    num_workers = set_threads(num_threads, parallelize, num_workers)
+    if seed is not None:
+        torch.manual_seed(int(seed))
     dev = resolve_device(device or getattr(model, 'device', None))
     if hasattr(model, 'to_device'):
         model.to_device(dev)
@@ -357,15 +539,67 @@ def fit_torch(
         model.to(dev)
     y = to_categorical(y, num_classes=len(model.labels_enc.keys()))    
     total_samples = x.shape[0]
-    if total_samples > max_cells:
-        train_dataloader, val_dataloader, num_batches, num_batches_val = dataloaders_from_dask(
-            x, y, batch_size, num_workers)
 
-    else:
-        train_dataloader, val_dataloader = dataloaders_from_dense(x, y, batch_size, num_workers)
-        num_batches = len(train_dataloader)
-        num_batches_val = len(val_dataloader)
+    # GPU optimization: for small node matrices move the whole tensor to the
+    # device once, eliminating per-batch host->device copies. For larger
+    # matrices fall back to host-resident data with fork-safe CPU workers that
+    # prefetch/pin batches. CPU callers stay sparse to keep memory low.
+    _GPU_DENSE_LIMIT_BYTES = 1024 * 1024 ** 2
+    tensors_on_device = False
+    pin = False
+    if str(dev.type) == 'cuda':
+        dense_bytes = x.shape[0] * x.shape[1] * 4
+        y_t = torch.from_numpy(y).to(dev, non_blocking=True)
+        if dense_bytes <= _GPU_DENSE_LIMIT_BYTES:
+            x_dense = np.asarray(_to_dense(x), dtype=np.float32)
+            x_t = torch.from_numpy(x_dense).to(dev, non_blocking=True)
+            tensors_on_device = True
+            dataset = TensorDataset(x_t, y_t)
+            train_dataset, val_dataset = _seeded_split(dataset, seed)
+            # No workers/CUDA memory sharing, no host pin overhead.
+            train_dataloader = DataLoader(
+                train_dataset, batch_size=batch_size, shuffle=True,
+                drop_last=(len(train_dataset) % batch_size == 1))
+            batch_size = min(batch_size, len(val_dataset))
+            val_dataloader = DataLoader(
+                val_dataset, batch_size=batch_size, shuffle=False,
+                drop_last=(len(val_dataset) % batch_size == 1))
+            num_batches = len(train_dataloader)
+            num_batches_val = len(val_dataloader)
+            if resource_stats is not None:
+                resource_stats['tensors_on_device'] = True
+                resource_stats['dense_bytes'] = dense_bytes
+        else:
+            pin = (os.environ.get('COMPOCYTE_PIN_MEMORY', '1') == '1')
 
+    if not tensors_on_device:
+        pin = (str(dev.type) == 'cuda'
+               and os.environ.get('COMPOCYTE_PIN_MEMORY', '1') == '1')
+        if total_samples > max_cells:
+            train_dataloader, val_dataloader, num_batches, num_batches_val = dataloaders_from_dask(
+                x, y, batch_size, num_workers, seed=seed, pin_memory=pin)
+
+        else:
+            train_dataloader, val_dataloader = dataloaders_from_dense(
+                x, y, batch_size, num_workers, seed=seed, pin_memory=pin)
+            num_batches = len(train_dataloader)
+            num_batches_val = len(val_dataloader)
+
+    if resource_stats is not None:
+        cfg = _resolve_loader_config(total_samples, x.shape[1], batch_size,
+                                     0 if tensors_on_device else num_workers)
+        resource_stats.update(cfg)
+        resource_stats['device'] = str(dev)
+        resource_stats['pin_memory'] = bool(pin)
+        resource_stats['num_workers_requested'] = 0 if tensors_on_device else num_workers
+        resource_stats['torch_threads'] = torch.get_num_threads()
+        resource_stats['tensors_on_device'] = tensors_on_device
+        resource_stats['rss_before_bytes'] = current_rss_bytes()
+        resource_stats['rss_peak_before_bytes'] = peak_rss_bytes()
+        if str(dev.type) == 'cuda' and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    t_fit0 = time.perf_counter()
     model.train()
     optimizer = torch.optim.SGD(
         model.parameters(), 
@@ -387,7 +621,8 @@ def fit_torch(
         class_balanced=class_balance,
         safe=True
     )
-    state_dicts = []
+    best_state = None
+    best_val = np.inf
     learning_curve = pd.DataFrame(columns=['loss', 'val_loss', 'lr'])
     for epoch in range(epochs):
         if hasattr(train_dataloader.dataset, 'set_epoch'):
@@ -424,11 +659,24 @@ def fit_torch(
 
         val_loss = running_vloss / num_batches_val
         learning_curve.loc[epoch, ['loss', 'val_loss', 'lr']] = cumulative_loss, val_loss, scheduler.get_last_lr()
-        state_dicts.append(deepcopy(model.state_dict()))
-        
-    model.load_state_dict(state_dicts[np.argmin(learning_curve['val_loss'].values)])
+        # Keep only the best snapshot: v1 retained all epochs (O(epochs * params) RAM).
+        # Strict '<' reproduces np.argmin, which selects the first best epoch.
+        if best_state is None or val_loss < best_val:
+            best_val = val_loss
+            best_state = deepcopy(model.state_dict())
+
+    model.load_state_dict(best_state)
     model.is_fitted = True
-    
+    if resource_stats is not None:
+        resource_stats['fit_s'] = time.perf_counter() - t_fit0
+        resource_stats['rss_after_bytes'] = current_rss_bytes()
+        resource_stats['rss_delta_bytes'] = max(
+            0, resource_stats['rss_after_bytes']
+            - resource_stats.get('rss_before_bytes', 0))
+        resource_stats['n_batches'] = int(num_batches)
+        if str(dev.type) == 'cuda' and torch.cuda.is_available():
+            resource_stats['gpu_peak_bytes'] = int(torch.cuda.max_memory_allocated())
+
     return learning_curve
 
 def fit_logreg(model: LogisticRegression, x, y, **fit_kwargs):
@@ -480,6 +728,9 @@ def fit(
         for idx in standardize_idx:
             scaled = row_robust_scale(x[idx])
             x[idx] = sparse.csr_matrix(scaled) if sparse.issparse(x) else scaled
+    elif isinstance(model, DenseTorch) and sparse.issparse(x):
+        # Keep the training matrix sparse so no full dense copy is materialized.
+        x = row_robust_scale_sparse(x)
     else:
         x = row_robust_scale(x)
 

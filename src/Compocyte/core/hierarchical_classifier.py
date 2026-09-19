@@ -18,6 +18,13 @@ import multiprocessing as mp
 from Compocyte.core.models.trees import BoostedTrees
 from Compocyte.core.tools import infer_dict, z_transform_properties
 
+_PARALLEL_TRAIN_STATE = None
+
+
+def _train_single_node_worker(node):
+    state, fit_kwargs = _PARALLEL_TRAIN_STATE
+    return state.train_single_node(node, **fit_kwargs)
+
 
 class HierarchicalClassifier(
         DataBase,
@@ -675,34 +682,38 @@ class HierarchicalClassifier(
             features_kwargs = {}
             classifier_kwargs = {}
 
+        import time
+        node_timing = {}
         if not has_classifier:
             subset = self.select_subset(node)
             if len(subset) < 5:
                 return
-            
+
+            fs0 = time.perf_counter()
             features = self.run_feature_selection(node, **features_kwargs)
+            node_timing['feature_selection_s'] = time.perf_counter() - fs0
             self.graph.nodes[node]['selected_var_names'] = features
             classifier_type = DenseTorch
             hidden_layers = classifier_kwargs.get('hidden_layers', [])
             if -1 in hidden_layers:
                 classifier_type = BoostedTrees
-                
+
             # If classifier types other than the standard have been set, use those
             specified_classifier_types =  getattr(self, 'specified_classifier_types', {})
             classifier_type = specified_classifier_types.get(node, classifier_type)
             self.create_local_classifier(node, classifier_type=classifier_type, **classifier_kwargs)
-        
+
         child_obs = self.obs_names[self.node_to_depth[node] + 1]
         features = self.graph.nodes[node]['selected_var_names']
         subset = self.select_subset(node, features=features)
         if len(subset) == 0:
                 return
-        
+
         model = self.graph.nodes[node]['local_classifier']
         x = subset.X
         y = subset.obs[child_obs].values
         print(f'Training at {node}.')
-        
+
         if standardize_separately is not None:
             idx = []
             for dataset in subset.obs[standardize_separately].unique():
@@ -710,17 +721,18 @@ class HierarchicalClassifier(
 
         else:
             idx = None
-            
+
         if not 'max_cells' in fit_kwargs:
             fit_kwargs['max_cells'] = getattr(self, 'max_cells', 1_000_000)
 
         if not 'num_threads' in fit_kwargs:
             fit_kwargs['num_threads'] = self.num_threads
-            
+
         # Necessary to avoid data loss when using mp.pool
         return {
             **self.graph.nodes[node],
-            'learning_curve': fit(model, x, y, standardize_idx=idx, **fit_kwargs)
+            'learning_curve': fit(model, x, y, standardize_idx=idx, **fit_kwargs),
+            'node_timing': node_timing,
         }
     
     def set_classifier_type(self, node, classifier_type):
@@ -798,17 +810,46 @@ class HierarchicalClassifier(
             
             # When setting num_threads > 1 per training process, the number of processes should be limited
             if self.num_threads is not None:
-                processes = int(processes / self.num_threads)
+                processes = max(1, int(processes / self.num_threads))
 
-            print(f"Using multiprocessing for training with {mp.cpu_count()} available CPU cores.\n")           
-            with mp.Pool(processes=processes) as pool: 
-                all_trained_node_params = pool.map(self.train_single_node, nodes_to_train)
+            print(f"Using multiprocessing for training with {mp.cpu_count()} available CPU cores.\n")
+            all_trained_node_params = self._train_nodes_in_pool(nodes_to_train, processes)
             
             for node, params in zip(nodes_to_train, all_trained_node_params):
+
                 if params is not None: #this should only happen at nodes that have not been trained
                     for key in params.keys():         
                         if params.get(key) is not None:    
                             self.graph.nodes[node][key] = params.get(key)
+
+    def _train_nodes_in_pool(self, nodes_to_train, processes, fit_kwargs=None):
+        """Train nodes in a process pool without pickling ``self`` per task.
+
+        ``pool.map(self.train_single_node, ...)`` serializes the bound method for
+        every task chunk, which pickles the whole ``adata`` and graph with it and
+        duplicates that buffer in each worker. With a forking start method the
+        children already inherit the parent's address space, so handing them a
+        module-level reference avoids the copies entirely.
+        """
+        global _PARALLEL_TRAIN_STATE
+        try:
+            start_method = mp.get_start_method(allow_none=False)
+        except Exception:
+            start_method = None
+
+        if start_method != 'fork':
+            from functools import partial
+            with mp.Pool(processes=processes) as pool:
+                return pool.map(
+                    partial(self.train_single_node, **(fit_kwargs or {})),
+                    nodes_to_train)
+
+        _PARALLEL_TRAIN_STATE = (self, fit_kwargs or {})
+        try:
+            with mp.Pool(processes=processes) as pool:
+                return pool.map(_train_single_node_worker, nodes_to_train)
+        finally:
+            _PARALLEL_TRAIN_STATE = None
 
     def predict_single_node(
         self,
