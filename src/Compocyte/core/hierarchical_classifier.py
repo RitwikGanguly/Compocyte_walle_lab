@@ -554,9 +554,11 @@ class HierarchicalClassifier(
             node (str): Name of the hierarchy node.
             overwrite (bool): If ``True``, replace any existing classifier at this
                 node. Defaults to ``False``.
-            classifier_type (type or str): Classifier class to instantiate, or one of
-                the strings ``'DenseTorch'``, ``'LogisticRegression'``, or
-                ``'BoostedTrees'``. Defaults to ``DenseTorch``.
+            classifier_type (type or str): Classifier class to instantiate, or the
+                name of a registered classifier (see
+                ``Compocyte.core.models.registry`` for built-ins such as
+                ``'DenseTorch'``, ``'LogisticRegression'`` or ``'BoostedTrees'``
+                and third-party plugins). Defaults to ``DenseTorch``.
             **classifier_kwargs: Additional keyword arguments forwarded to the
                 classifier constructor (e.g. ``hidden_layers``, ``dropout``).
 
@@ -588,17 +590,12 @@ class HierarchicalClassifier(
         n_input = len(features)
         n_output = len(labels)
         if isinstance(classifier_type, str):
-            if classifier_type == 'DenseTorch':
-                classifier_type = DenseTorch
-
-            elif classifier_type == 'LogisticRegression':
-                classifier_type = LogisticRegression
-
-            elif classifier_type == 'BoostedTrees':
-                classifier_type = BoostedTrees
-
-            else:
-                raise Exception(f'Unknown classifier type: {classifier_type}')
+            from Compocyte.core.models.registry import get as _get_classifier
+            try:
+                classifier_type = _get_classifier(classifier_type)
+            except (KeyError, ImportError) as e:
+                raise Exception(
+                    f'Unknown classifier type: {classifier_type} ({e})')
             
         if n_output == 1:
             classifier_type = DummyClassifier

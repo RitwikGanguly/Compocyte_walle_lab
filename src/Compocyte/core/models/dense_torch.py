@@ -1,9 +1,23 @@
 import numpy as np
-import torch
 import os
 import pickle
 import logging
 logger = logging.getLogger(__name__)
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    _TORCH_AVAILABLE = False
+
+
+def _require_torch():
+    if not _TORCH_AVAILABLE:
+        raise ImportError(
+            "DenseTorch requires the 'torch' extra: "
+            "pip install \"Compocyte[torch]\"")
+    return torch
 
 try:
     from scipy import sparse as _sparse
@@ -18,13 +32,14 @@ def resolve_device(device=None):
     Always returns a ``torch.device``; CPU-only machines transparently fall
     back to ``'cpu'`` so all call sites stay device-agnostic.
     """
+    _torch = _require_torch()
     if device is not None:
-        return torch.device(device) if not isinstance(device, torch.device) else device
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        return torch.device('mps')
-    return torch.device('cpu')
+        return _torch.device(device) if not isinstance(device, _torch.device) else device
+    if _torch.cuda.is_available():
+        return _torch.device('cuda')
+    if hasattr(_torch.backends, 'mps') and _torch.backends.mps.is_available():
+        return _torch.device('mps')
+    return _torch.device('cpu')
 
 
 def _to_dense_float32(x):
@@ -33,7 +48,17 @@ def _to_dense_float32(x):
     x = np.asarray(x, dtype=np.float32)
     return x
 
-class DenseTorch(torch.nn.Module):
+if _TORCH_AVAILABLE:
+    _DenseTorchBase = torch.nn.Module
+else:  # torch-free installs: importing the module must still work so that
+    # isinstance checks and the classifier registry keep functioning. Only
+    # instantiating or calling raises, with a pointer to the right extra.
+    class _DenseTorchBase:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            _require_torch()
+
+
+class DenseTorch(_DenseTorchBase):
     def __init__(
             self, 
             labels: list, 
@@ -174,7 +199,8 @@ class DenseTorch(torch.nn.Module):
 
     @classmethod
     def _load(cls, path):
-        model = torch.load(os.path.join(path, 'model'), map_location='cpu', weights_only=False)
+        _torch = _require_torch()
+        model = _torch.load(os.path.join(path, 'model'), map_location='cpu', weights_only=False)
         with open(os.path.join(path, 'non_param_dict.pickle'), 'rb') as f:
             non_param_dict = pickle.load(f)
 

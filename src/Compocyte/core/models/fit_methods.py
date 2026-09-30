@@ -7,17 +7,75 @@ import pandas as pd
 from scipy import sparse
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import robust_scale
-import torch
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data import (
+        TensorDataset, random_split, DataLoader, IterableDataset,
+        Dataset, get_worker_info,
+    )
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    F = None
+    _TORCH_AVAILABLE = False
+
+    class _TorchPlaceholder:
+        """Stands in for torch classes when torch is not installed.
+
+        Importing this module must succeed so that sklearn-only paths keep
+        working; only touching torch functionality raises, with a pointer
+        to the right extra.
+        """
+        def __init__(self, *args, **kwargs):
+            _require_torch()
+
+    TensorDataset = random_split = DataLoader = get_worker_info = _missing_torch_callable = None  # placeholders, replaced below
+    IterableDataset = Dataset = _TorchPlaceholder
+
+
+def _missing_torch_callable(*args, **kwargs):
+    _require_torch()
+
+
+TensorDataset = TensorDataset if _TORCH_AVAILABLE else _missing_torch_callable
+random_split = random_split if _TORCH_AVAILABLE else _missing_torch_callable
+DataLoader = DataLoader if _TORCH_AVAILABLE else _missing_torch_callable
+get_worker_info = get_worker_info if _TORCH_AVAILABLE else _missing_torch_callable
+
+
+def _require_torch():
+    if not _TORCH_AVAILABLE:
+        raise ImportError(
+            "This code path requires the 'torch' extra: "
+            "pip install \"Compocyte[torch]\"")
+    return torch
+
+
+def _require_dask():
+    try:
+        import dask.array as da
+    except ImportError as e:
+        raise ImportError(
+            "The out-of-core (dask) training path requires the 'atlas' extra: "
+            "pip install \"Compocyte[atlas]\"") from e
+    return da
+
+
+def _require_balanced_loss():
+    try:
+        from balanced_loss import Loss as BalancedLoss
+    except ImportError as e:
+        raise ImportError(
+            "Class-balanced focal loss requires the 'focal' extra: "
+            "pip install \"Compocyte[focal]\"") from e
+    return BalancedLoss
 import logging
-import dask.array as da
-from torch.utils.data import TensorDataset, random_split, DataLoader, IterableDataset, Dataset, get_worker_info
 from functools import partial
 from Compocyte.core.models.dense_torch import DenseTorch, resolve_device
 from Compocyte.core.models.dummy_classifier import DummyClassifier
 from Compocyte.core.models.log_reg import LogisticRegression
 from Compocyte.core.models.trees import BoostedTrees
-from balanced_loss import Loss as BalancedLoss
 from scipy import stats
 
 logger = logging.getLogger(__name__)
@@ -226,6 +284,7 @@ class DaskBatchDataset(IterableDataset):
         def _drain():
             if not pending:
                 return
+            da = _require_dask()
             flat = [d for pair in pending for d in pair]
             done = da.compute(*flat)
             for i in range(0, len(done), 2):
@@ -235,6 +294,7 @@ class DaskBatchDataset(IterableDataset):
             pending.clear()
 
         def _flush(buf_X, buf_y, chunk_sizes):
+            _require_torch()
             X_buf = np.concatenate(buf_X, axis=0)
             y_buf = np.concatenate(buf_y, axis=0)
             perm = rng.permutation(len(X_buf))
@@ -272,6 +332,7 @@ class SparseBatchDataset(Dataset):
 
 
 def _sparse_collate(batch_idx, X_csr, y_cat):
+    _require_torch()
     idx = np.asarray(batch_idx, dtype=np.int64)
     xb = torch.from_numpy(np.asarray(X_csr[idx].toarray(), dtype=np.float32))
     yb = torch.from_numpy(np.asarray(y_cat)[idx]).to(torch.float32)
@@ -331,6 +392,9 @@ def predict(
             elif isinstance(model, (LogisticRegression, BoostedTrees)):
                 # sklearn/catboost stay on CPU: convert once, then mask the single
                 # resident tensor per iteration instead of re-copying every pass.
+                # Masking uses torch; deterministic (non-MC) sklearn inference
+                # stays torch-free.
+                _require_torch()
                 dev = resolve_device(device)
                 x_arr = np.asarray(x, dtype=np.float32)
                 x_t = torch.from_numpy(x_arr).to(dev)
@@ -378,6 +442,7 @@ def predict(
     return pred
 
 def samples_per_class(y):
+    _require_torch()
     spc = list(torch.zeros(y.shape[1]))
     classes_counted = np.unique(np.argmax(y, axis=1), return_counts=True)
     for c, samples in zip(classes_counted[0], classes_counted[1]):
@@ -386,6 +451,7 @@ def samples_per_class(y):
     return spc
 
 def set_threads(num_threads, parallelize, num_workers=None):
+    _require_torch()
     budget = train_resource_budget()
     env_workers = os.environ.get('COMPOCYTE_NUM_WORKERS')
     if env_workers is not None:
@@ -411,6 +477,8 @@ def set_threads(num_threads, parallelize, num_workers=None):
     return num_workers
 
 def dataloaders_from_dask(x, y, batch_size, num_workers, seed=12345, pin_memory=False):
+    _require_torch()
+    _require_dask()
     total_samples = x.shape[0]
 
     indices = np.arange(total_samples)
@@ -453,6 +521,7 @@ def dataloaders_from_dask(x, y, batch_size, num_workers, seed=12345, pin_memory=
     return train_dataloader, val_dataloader, num_batches, num_batches_val
 
 def _seeded_split(dataset, seed):
+    _require_torch()
     gen = torch.Generator().manual_seed(int(seed))
     return random_split(dataset, [0.8, 0.2], generator=gen)
 
@@ -464,6 +533,7 @@ def _loader_kwargs(workers, prefetch, pin):
     return kw
 
 def dataloaders_from_dense(x, y, batch_size, num_workers, seed=12345, pin_memory=False):
+    _require_torch()
     n_cells = x.shape[0]
     n_genes = x.shape[1]
     cfg = _resolve_loader_config(n_cells, n_genes, batch_size, num_workers)
@@ -528,7 +598,8 @@ def fit_torch(
         parallelize: bool=True, num_threads: int=1, num_workers: int=None,
         beta: float=0.8, gamma: float=2.0, class_balance: bool=True, max_cells: int=1_000_000,
         device=None, seed: int=12345, resource_stats: dict=None):
-    
+
+    _require_torch()
     num_workers = set_threads(num_threads, parallelize, num_workers)
     if seed is not None:
         torch.manual_seed(int(seed))
@@ -613,7 +684,7 @@ def fit_torch(
         epochs=epochs,
         steps_per_epoch=num_batches
     )
-    loss_function = BalancedLoss(
+    loss_function = _require_balanced_loss()(
         loss_type="focal_loss",
         samples_per_class=samples_per_class(y),
         beta=beta, # class-balanced loss beta
