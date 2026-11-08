@@ -106,10 +106,16 @@ def main():
         reference_model=scpoli_model,
         labeled_indices=train_idx,
     )
-    scpoli_query.train(
-        n_epochs=args.epochs,
-        eta=10,
-    )
+    # Query adaptation (label-transfer/refinement) should be much lighter than
+    # reference training.  Use a reduced epoch budget, lower eta, and the same
+    # early-stopping criteria so "inference" does not degenerate into a second
+    # full training run.
+    query_adapt_kwargs = {
+        "n_epochs": 50,
+        "early_stopping_kwargs": early_stopping_kwargs,
+        "eta": 3,
+    }
+    scpoli_query.train(**query_adapt_kwargs)
     results_dict = scpoli_query.classify(combined[test_idx].copy(), scale_uncertainties=True)
     t3 = time.perf_counter()
     inference_peak = inf_sampler.stop()

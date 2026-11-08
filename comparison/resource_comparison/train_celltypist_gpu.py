@@ -4,13 +4,21 @@
 Usage:
     python train_celltypist_gpu.py --subset oelen_e1_500k
 
-CellTypist's GPU support is optional and relies on two RAPIDS packages:
-  * `cuml`          – trains the logistic-regression classifier on the GPU
-  * `rapids_singlecell` – runs the over-clustering step of majority voting on the GPU
+CellTypist's GPU support relies on two RAPIDS packages:
+  * `cuml`            - trains the logistic-regression classifier on the GPU
+  * `rapids_singlecell` - runs the over-clustering step of majority voting on
+                          the GPU (optional; without it CellTypist falls back
+                          to scanpy's CPU neighbour graph, and only the
+                          over-clustering is affected)
 
-If either package is missing the script exits immediately with install
-instructions, because `celltypist.train(..., use_GPU=True)` returns None when
-cuml is absent and would crash downstream.
+Both live in the dedicated `ct-gpu` conda environment, because the `scrna`
+environment's scientific stack is pip-installed and its torch pins
+nvidia-*-cu12==12.8 -- adding conda's RAPIDS packages there would downgrade
+torch's CUDA libraries and break scANVI / scPoli / treeArches.
+See `setup_celltypist_gpu_env.sh` for the exact creation commands.
+
+Run this script with the `ct-gpu` environment, e.g.:
+    conda run -n ct-gpu python train_celltypist_gpu.py --subset oelen_e1_500k
 """
 import argparse
 import importlib.util
@@ -29,20 +37,80 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(HERE, "results", "gpu")
 
 
+def _patch_celltypist_gpu_overcluster():
+    """Work around a celltypist 1.7.1 bug in the GPU majority-voting path.
+
+    ``Classifier._construct_neighbor_graph`` moves the AnnData to the GPU and
+    then calls *scanpy's* ``sc.pp.filter_genes`` on the GPU-backed object:
+
+        if use_GPU:
+            fsc.get.anndata_to_GPU(adata)     # X becomes a cupy array
+        if 'highly_variable' not in adata.var:
+            sc.pp.filter_genes(adata, min_cells=5)   # <-- scanpy on GPU data
+            fsc.pp.highly_variable_genes(adata, n_top_genes=min([2500, adata.n_vars]))
+
+    which raises::
+
+        TypeError: Implicit conversion to a NumPy array is not allowed.
+        Please use `.get()` to construct a NumPy array explicitly.
+
+    The fix is to run the cheap gene filtering / HVG selection on the CPU
+    *before* the GPU transfer, using exactly the same scanpy calls the CPU
+    code path uses (so the CPU and GPU runs stay numerically comparable), and
+    then let rapids-singlecell do the expensive part -- scaling, PCA, the KNN
+    graph and Leiden -- on the GPU.
+    """
+    from celltypist.classifier import Classifier
+
+    original = Classifier._construct_neighbor_graph
+
+    def patched(adata, use_GPU=False):
+        if (
+            use_GPU
+            and "highly_variable" not in adata.var
+            and getattr(adata, "raw", None) is None
+        ):
+            sc.pp.filter_genes(adata, min_cells=5)
+            sc.pp.highly_variable_genes(
+                adata, n_top_genes=min([2500, adata.n_vars])
+            )
+        return original(adata, use_GPU)
+
+    Classifier._construct_neighbor_graph = staticmethod(patched)
+
+
 def _require_gpu_deps():
-    missing = []
-    for pkg in ("cuml", "rapids_singlecell"):
-        if importlib.util.find_spec(pkg) is None:
-            missing.append(pkg)
-    if missing:
+    """Check the RAPIDS packages CellTypist needs for GPU execution.
+
+    ``cuml`` is mandatory: ``celltypist.train(..., use_GPU=True)`` returns
+    None when it is missing, which would crash the run later on.
+
+    ``rapids_singlecell`` is optional: it only accelerates the
+    over-clustering step of majority voting.  Without it CellTypist falls back
+    to scanpy's CPU neighbour graph, and the logistic-regression training is
+    still performed on the GPU.
+    """
+    if importlib.util.find_spec("cuml") is None:
         raise RuntimeError(
-            "CellTypist GPU benchmark requires the following RAPIDS packages, "
-            f"which are not installed: {', '.join(missing)}.\n"
-            "Install them in the scrna environment, for example:\n"
-            "    conda run -n scrna conda install -c rapidsai -c conda-forge "
-            "-c nvidia cuml rapids-singlecell\n"
-            "(match the RAPIDS CUDA version to your driver; this node has "
-            "driver 525.105.17 / CUDA 12.0)."
+            "CellTypist GPU benchmark requires the RAPIDS package 'cuml', "
+            "which is not installed in this environment.\n"
+            "Create the dedicated 'ct-gpu' environment, for example:\n"
+            "    conda create -n ct-gpu -y -c rapidsai -c nvidia -c conda-forge "
+            "cuml=24.08 cudf=24.08 cugraph=24.08 'cupy>=12.0' rmm=24.08 "
+            "python=3.10 cuda-version=12.5 'nccl>=2.9.9,<3.0a0' "
+            "'nvtx>=0.2.1,<0.3' scanpy=1.10.3 anndata=0.10.8 numpy=1.26.4 "
+            "scipy=1.13.1 scikit-learn=1.6.1 natsort scikit-misc statsmodels "
+            "scikit-image h5py loompy pyyaml requests tqdm matplotlib "
+            "python-igraph leidenalg openpyxl click pip\n"
+            "    conda run -n ct-gpu pip install --no-deps celltypist==1.7.1 "
+            "rapids-singlecell==0.10.10"
+        )
+    if importlib.util.find_spec("rapids_singlecell") is None:
+        print(
+            "WARNING: 'rapids_singlecell' is not installed. The logistic "
+            "regression will still be trained on the GPU, but the "
+            "over-clustering used by majority voting falls back to CPU.",
+            file=sys.stderr,
         )
 
 
@@ -55,6 +123,7 @@ def main():
     args = ap.parse_args()
 
     _require_gpu_deps()
+    _patch_celltypist_gpu_overcluster()
 
     os.makedirs(args.out_dir, exist_ok=True)
     train, test = load_subset(args.subset, seed=args.seed, test_size=args.test_size)

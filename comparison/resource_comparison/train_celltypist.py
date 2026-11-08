@@ -26,10 +26,12 @@ def main():
     ap.add_argument("--out-dir", default=RESULTS_DIR)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--test-size", type=float, default=0.2)
+    ap.add_argument("--fold", type=int, default=None,
+                    help="5-fold CV fold index (0-4). Default: single random split.")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    train, test = load_subset(args.subset, seed=args.seed, test_size=args.test_size)
+    train, test = load_subset(args.subset, seed=args.seed, test_size=args.test_size, fold=args.fold)
 
     train.obs["label"] = train.obs["annotation"].astype(str)
     test.obs["label"] = test.obs["annotation"].astype(str)
@@ -70,6 +72,7 @@ def main():
         "n_train": int(train.n_obs),
         "n_test": int(test.n_obs),
         "n_genes": int(train.n_vars),
+        "fold": args.fold,
         "train_s": t1 - t0,
         "inference_s": t3 - t2,
         "rss_train_peak_bytes": int(train_peak),

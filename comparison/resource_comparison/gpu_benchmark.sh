@@ -6,12 +6,22 @@
 # coexist with the CPU benchmark results in results/cpu/.
 #
 # NOTE: CellTypist GPU requires the RAPIDS packages `cuml` and
-# `rapids_singlecell` in the `scrna` environment.  The script checks for them
-# before starting.  If they are missing, install them first, for example:
-#     conda run -n scrna conda install -c rapidsai -c conda-forge -c nvidia \
-#         cuml rapids-singlecell
-# (match the RAPIDS CUDA version to your driver; this node has driver
-# 525.105.17 / CUDA 12.0).
+# `rapids_singlecell`.  They live in a dedicated conda env (`ct-gpu`) because
+# the `scrna` env's whole scientific stack is pip-installed and its torch pins
+# nvidia-*-cu12==12.8 -- installing conda's RAPIDS packages there would
+# downgrade torch's CUDA libraries and break scANVI/scPoli/treeArches.
+# The `ct-gpu` env was created with:
+#     conda create -n ct-gpu -y -c rapidsai -c nvidia -c conda-forge \
+#         cuml=24.08 cudf=24.08 cugraph=24.08 "cupy>=12.0" rmm=24.08 \
+#         python=3.10 cuda-version=12.5 "nccl>=2.9.9,<3.0a0" \
+#         "nvtx>=0.2.1,<0.3" scanpy=1.10.3 anndata=0.10.8 numpy=1.26.4 \
+#         scipy=1.13.1 scikit-learn=1.6.1 natsort scikit-misc statsmodels \
+#         scikit-image h5py loompy pyyaml requests tqdm matplotlib \
+#         python-igraph leidenalg openpyxl click pip
+#     conda run -n ct-gpu pip install --no-deps \
+#         celltypist==1.7.1 rapids-singlecell==0.10.10
+# If the `ct-gpu` env is missing, the script skips CellTypist GPU and still
+# runs the other four GPU methods.
 #
 # Usage:
 #     cd comparison/resource_comparison
@@ -27,7 +37,13 @@ CONDA_BASE="${HOME}/miniconda3"
 
 # Conda environments
 COMP_GPU_ENV="compo-gpu"    # Compocyte v2_gpu
-SOTA_ENV="scrna"            # scANVI / CellTypist / treeArches / scPoli / figure
+SOTA_ENV="scrna"            # scANVI / treeArches / scPoli / figure
+# CellTypist needs the RAPIDS stack (cuml / rapids-singlecell), which cannot
+# live in the `scrna` env: that env's whole scientific stack is pip-installed
+# and its torch pins nvidia-*-cu12==12.8, so adding conda's RAPIDS packages
+# there would downgrade torch's CUDA libraries and break scANVI/scPoli/
+# treeArches.  `ct-gpu` is a dedicated env with RAPIDS 24.08 + numpy 1.26.4.
+CELLTYPIST_ENV="ct-gpu"
 
 # Subsets to benchmark (must match keys in shared.py)
 SUBSETS=("liu_100k" "zhang_250k" "oelen_e1_500k")
@@ -75,7 +91,7 @@ echo "Free disk space: ${FREE_GB} GB"
 echo ""
 echo "===== Checking Python environments ====="
 source_conda
-for env in "$COMP_GPU_ENV" "$SOTA_ENV"; do
+for env in "$COMP_GPU_ENV" "$SOTA_ENV" "$CELLTYPIST_ENV"; do
     if ! conda info --envs | awk '{print $1}' | grep -qx "$env"; then
         echo "ERROR: conda environment '$env' not found." >&2
         exit 1
@@ -104,7 +120,7 @@ fi
 
 echo ""
 echo "===== Checking CellTypist GPU dependencies ====="
-CT_CHECK=$(conda run -n "$SOTA_ENV" python -c "
+CT_CHECK=$(conda run -n "$CELLTYPIST_ENV" python -c "
 import importlib.util
 missing = [p for p in ('cuml', 'rapids_singlecell') if importlib.util.find_spec(p) is None]
 if missing:
@@ -115,7 +131,7 @@ if echo "$CT_CHECK" | grep -q "OK"; then
     RUN_CELLTYPIST_GPU=1
 else
     RUN_CELLTYPIST_GPU=0
-    echo "WARNING: CellTypist GPU dependencies missing (cuml/rapids_singlecell)." >&2
+    echo "WARNING: CellTypist GPU dependencies missing in $CELLTYPIST_ENV (cuml/rapids_singlecell)." >&2
     echo "         Skipping CellTypist GPU. Install them and re-run to include it." >&2
     echo "$CT_CHECK" >&2
 fi
@@ -139,7 +155,7 @@ for subset in "${SUBSETS[@]}"; do
 
     if [ "$RUN_CELLTYPIST_GPU" -eq 1 ]; then
         echo "  CellTypist (GPU) ..."
-        run_py "$SOTA_ENV" train_celltypist_gpu.py --subset "$subset" --out-dir results/gpu || true
+        run_py "$CELLTYPIST_ENV" train_celltypist_gpu.py --subset "$subset" --out-dir results/gpu || true
     fi
 
     echo "  treeArches (GPU) ..."

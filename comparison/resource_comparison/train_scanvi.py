@@ -27,10 +27,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--test-size", type=float, default=0.2)
+    ap.add_argument("--fold", type=int, default=None,
+                    help="5-fold CV fold index (0-4). Default: single random split.")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    train, test = load_subset(args.subset, seed=args.seed, test_size=args.test_size)
+    train, test = load_subset(args.subset, seed=args.seed, test_size=args.test_size, fold=args.fold)
 
     scvi.settings.seed = args.seed
     np.random.seed(args.seed)
@@ -93,6 +95,7 @@ def main():
         "n_test": int(test.n_obs),
         "n_genes": int(combined.n_vars),
         "epochs": args.epochs,
+        "fold": args.fold,
         "train_s": t1 - t0,
         "inference_s": t3 - t2,
         "rss_train_peak_bytes": int(train_peak),

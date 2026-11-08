@@ -27,10 +27,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--test-size", type=float, default=0.2)
+    ap.add_argument("--fold", type=int, default=None,
+                    help="5-fold CV fold index (0-4). Default: single random split.")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    train, test = load_subset(args.subset, seed=args.seed, test_size=args.test_size)
+    train, test = load_subset(args.subset, seed=args.seed, test_size=args.test_size, fold=args.fold)
 
     train.obs["last_label"] = train.obs["annotation"].astype(str)
     train.obs["batch"] = train.obs["dataset"].astype(str)
@@ -93,10 +95,16 @@ def main():
         reference_model=scpoli_model,
         labeled_indices=train_idx,
     )
-    scpoli_query.train(
-        n_epochs=args.epochs,
-        eta=10,
-    )
+    # Query adaptation (label-transfer/refinement) should be much lighter than
+    # reference training.  Use a reduced epoch budget, lower eta, and the same
+    # early-stopping criteria so "inference" does not degenerate into a second
+    # full training run.
+    query_adapt_kwargs = {
+        "n_epochs": 50,
+        "early_stopping_kwargs": early_stopping_kwargs,
+        "eta": 3,
+    }
+    scpoli_query.train(**query_adapt_kwargs)
     results_dict = scpoli_query.classify(combined[test_idx].copy(), scale_uncertainties=True)
     t3 = time.perf_counter()
     inference_peak = inf_sampler.stop()
@@ -108,6 +116,7 @@ def main():
         "n_test": int(test.n_obs),
         "n_genes": int(combined.n_vars),
         "epochs": args.epochs,
+        "fold": args.fold,
         "train_s": t1 - t0,
         "inference_s": t3 - t2,
         "rss_train_peak_bytes": int(train_peak),

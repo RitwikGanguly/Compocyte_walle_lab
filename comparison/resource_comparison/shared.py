@@ -25,7 +25,7 @@ import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
 from scipy.io import mmwrite
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW_DIR = os.path.join(os.path.dirname(HERE), "data", "suco_pbmc_extracted")
@@ -232,8 +232,15 @@ def _ensure_dataset_col(adata, dataset_name):
     return adata
 
 
-def load_subset(subset_name, seed=42, test_size=0.2):
-    """Load source h5ad, deterministically subset, split train/test."""
+def load_subset(subset_name, seed=42, test_size=0.2, fold=None, n_folds=5):
+    """Load source h5ad, deterministically subset, split train/test.
+
+    If ``fold`` is None (default), a single stratified random 80/20 split is
+    returned (legacy benchmark behaviour).  If ``fold`` is an integer in
+    [0, n_folds-1], a deterministic stratified ``n_folds`` CV partition is
+    built and the corresponding fold is returned, so every method trains on
+    the exact same cells for that fold.
+    """
     if subset_name not in SUBSET_CONFIG:
         raise ValueError(f"Unknown subset {subset_name}. Choose from {list(SUBSET_CONFIG)}")
     filename, n_cells = SUBSET_CONFIG[subset_name]
@@ -246,12 +253,20 @@ def load_subset(subset_name, seed=42, test_size=0.2):
     adata = _stratified_subset(adata, "annotation", n_cells, seed)
 
     idx = np.arange(adata.n_obs)
-    try:
-        tr, te = train_test_split(
-            idx, test_size=test_size, random_state=seed, stratify=adata.obs["annotation"].values
-        )
-    except ValueError:
-        tr, te = train_test_split(idx, test_size=test_size, random_state=seed)
+    labels = adata.obs["annotation"].values
+    if fold is not None:
+        if not (0 <= fold < n_folds):
+            raise ValueError(f"fold must be in [0, {n_folds-1}], got {fold}")
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        splits = list(skf.split(idx, labels))
+        tr, te = splits[int(fold)]
+    else:
+        try:
+            tr, te = train_test_split(
+                idx, test_size=test_size, random_state=seed, stratify=labels
+            )
+        except ValueError:
+            tr, te = train_test_split(idx, test_size=test_size, random_state=seed)
 
     return adata[tr].copy(), adata[te].copy()
 
