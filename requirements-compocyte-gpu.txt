@@ -1,0 +1,55 @@
+# Compocyte v2 — GPU requirements
+#
+# Reproduces the `compo-gpu` conda env used for the Compocyte v2_gpu benchmark
+# (comparison/resource_comparison/train_compocyte_gpu.py).
+# Tested with Python 3.12.14 + NVIDIA RTX A6000, driver 525.105.17.
+# pyproject.toml requires Python >= 3.12.
+#
+# System packages needed first (for pygraphviz / builds):
+#   conda install -c conda-forge gcc gxx graphviz pygraphviz
+#   (or: sudo apt-get install -y gcc g++ graphviz graphviz-dev)
+#
+# GPU driver requirement: torch==2.5.1+cu118 needs an NVIDIA driver
+# supporting CUDA 11.8 or newer (driver >= ~520). Check with `nvidia-smi`.
+# The cu118 wheels are fetched from the PyTorch CUDA index below.
+#
+# Install into a fresh env with:
+#   conda create -n compocyte-gpu python=3.12 -y
+#   conda activate compocyte-gpu
+#   conda install -c conda-forge gcc gxx graphviz pygraphviz
+#   pip install -r requirements-compocyte-gpu.txt
+#   pip install -e .        # this repo (provides the Compocyte package itself)
+
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# --- Compocyte direct dependencies (pinned to pyproject.toml [all]) ---
+anndata==0.12.11
+scanpy==1.12.1
+scikit-learn==1.8.0
+pooch==1.9.0
+torch==2.5.1+cu118
+catboost==1.2.10
+balanced-loss==0.1.1
+cytopus==1.3.4
+dask==2026.3.0
+leidenalg==0.11.0
+pygraphviz==1.14
+SEACells==0.3.3
+
+# --- Known-good transitive pins (from the frozen `compo-gpu` env) ---
+numpy==2.5.3
+pandas==2.3.3
+scipy==1.18.1
+h5py==3.16.0
+matplotlib==3.11.1
+networkx==3.6.1
+tqdm==4.70.0
+joblib==1.6.0
+threadpoolctl==3.6.0
+scikit-misc==0.5.3
+sympy==1.13.1
+triton==3.1.0
+
+# --- Optional: dev/test tooling (uncomment if needed) ---
+# pytest==9.0.3
+# nbmake==1.5.5
